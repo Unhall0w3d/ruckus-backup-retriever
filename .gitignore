@@ -1,0 +1,34 @@
+# Local PowerShell/editor artifacts
+*.ps1xml
+*.psm1
+*.psd1
+.vscode/
+.idea/
+
+# Generated settings/credentials/debug material
+settings.json
+*.credential.xml
+Credentials/
+DebugCapture/
+*.har
+*.log
+*.tmp
+
+# Downloaded backup artifacts
+*.bak
+*.zip
+*.tar
+*.tgz
+*.gz
+*.7z
+*.rar
+
+# Runtime status/output folders
+run-status.json
+last-run-status.json
+logs/
+20??????-??????/
+
+# OS clutter
+.DS_Store
+Thumbs.db
