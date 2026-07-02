@@ -204,9 +204,9 @@ To require valid certificate trust, run:
 
 ## Public repository safety notes
 
-The script does not include hardcoded customer hostnames, IP addresses, usernames, passwords, cookies, tokens, backup UUIDs, or environment-specific backup paths. Runtime settings and credentials are created locally on the machine where the script runs.
+The script does not include hardcoded hostnames, IP addresses, usernames, passwords, cookies, tokens, backup UUIDs, or environment-specific backup paths. Runtime settings and credentials are created locally on the machine where the script runs.
 
-Do not commit generated files such as credentials, settings JSON, downloaded backups, logs, HAR captures, or debug captures.
+Do not commit generated files such as credentials, settings JSON, downloaded backups, logs, HAR captures, or debug captures in Issues, or Pull requests.
 
 ## Disclaimer
 
