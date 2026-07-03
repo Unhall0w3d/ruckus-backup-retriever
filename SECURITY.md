@@ -4,4 +4,6 @@ Do not publish or attach generated backup files, credential XML files, settings 
 
 The script stores credentials using PowerShell `Export-Clixml`. On Windows, this uses DPAPI and is normally decryptable only by the same Windows user on the same machine.
 
-If you believe the script exposes sensitive runtime data, open an issue with redacted examples only. Do not post live SmartZone/vSZ hostnames, usernames, passwords, cookies, CSRF tokens, session IDs, backup UUIDs, or customer data.
+Do not post live SmartZone/vSZ hostnames, usernames, passwords, cookies, CSRF tokens, session IDs, backup UUIDs, switch names, customer data, or downloaded backup files in public issues.
+
+If you believe the script exposes sensitive runtime data, open an issue with redacted examples only.
