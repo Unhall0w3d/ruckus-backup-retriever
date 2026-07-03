@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs a small validation backup.
+    Runs cluster endpoint diagnostics without downloading full cluster backup files.
 #>
 
 [CmdletBinding()]
@@ -12,4 +12,4 @@ if (-not (Test-Path -LiteralPath $ScriptPath)) {
     throw "Script not found: $ScriptPath"
 }
 
-& $ScriptPath -SkipClusterBackups -MaxDownloadPerCategory 1
+& $ScriptPath -ClusterDiagnosticsOnly -SkipSwitchBackups -MaxDownloadPerCategory 1

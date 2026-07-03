@@ -25,10 +25,41 @@
 
     Use -DebugCapture to also save raw request/response metadata and bodies.
 
-    Version: 1.30.5
-    Changes in v1.30.5:
-      - Public repo refresh: removes environment-specific default backup root from first-run prompts/help
-      - Preserves v1.30.4 retry, unavailable switch record, and retention behavior
+    Version: 1.31.7
+    Changes in v1.31.7:
+      - Public repository refresh with generic first-run backup destination prompting.
+      - Removes environment-specific default OutputRoot from help text and first-run behavior.
+
+    Changes in v1.31.6:
+      - Fixes PowerShell 5.1 array wrapping in normalized lists and download task batches.
+
+    Changes in v1.31.5:
+      - Normalizes vectorized API list responses into individual backup records before task creation.
+      - Fixes PowerShell 5.1 array wrapping in normalized lists and download task batches.
+      - Fixes controllers that return System Configuration or Switch Configuration records as one object with array-valued properties.
+
+    Changes in v1.31.4:
+      - Adds defensive output path construction and pre-download task logging.
+
+    Changes in v1.31.3:
+      - Improves Windows-safe filename handling and switch config grouping.
+
+    Changes in v1.31.2:
+      - Treats Cluster backups as opportunistic and deletes partial Cluster files on failure.
+      - Adds ClusterRetryCount and ClusterBackupsPerBlade.
+
+    Changes in v1.31.1:
+      - Fixes ClusterDiagnosticsOnly array handling when one cluster endpoint is queued.
+      - Adds switch configuration filtering to keep only the newest N records per device.
+
+    Changes in v1.31.0:
+      - Adds cluster download endpoint diagnostics.
+      - Adds ClusterDiagnosticsOnly mode for probing cluster download headers/range support without downloading multi-GB backup files.
+      - Adds NoClusterHeaderProbe and ClusterProbeTimeoutSeconds controls.
+      - Applies RequestTimeoutSeconds to Invoke-WebRequest calls.
+
+    Changes in v1.30.4:
+      - Allows retention cleanup to run when only switch configuration records are classified as unavailable from the controller.
 
     Changes in v1.30.1:
       - Fixes PowerShell 5.1 parser issue in retry round log message when a variable was followed by a colon
@@ -46,8 +77,8 @@
 .NOTES
     Windows PowerShell 5.1 compatible, because apparently we still live here.
 
-    Default backup destination:
-      <OutputRoot>\<yyyyMMdd-HHmmss>\
+    Backup destination:
+      Prompted on first run or supplied with -OutputRoot. Timestamped run folders are created under that root.
 
     Retention default:
       Keep only the newest timestamped backup folder and remove older folders.
@@ -77,8 +108,20 @@ param(
     [int]$MaxDownloadPerCategory = 999,
 
     [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 100)]
+    [int]$SwitchConfigsPerDevice = 2,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 100)]
+    [int]$ClusterBackupsPerBlade = 1,
+
+    [Parameter(Mandatory = $false)]
     [ValidateRange(0, 10)]
     [int]$RetryCount = 2,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 10)]
+    [int]$ClusterRetryCount = 0,
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 3600)]
@@ -87,6 +130,16 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 86400)]
     [int]$RequestTimeoutSeconds = 0,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(5, 600)]
+    [int]$ClusterProbeTimeoutSeconds = 60,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ClusterDiagnosticsOnly,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoClusterHeaderProbe,
 
     [Parameter(Mandatory = $false)]
     [switch]$NoDownload,
@@ -128,7 +181,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$script:ScriptVersion = "1.30.5"
+$script:ScriptVersion = "1.31.7"
 $script:FinalExitCode = 1
 $script:RequestTimeoutSeconds = 0
 
@@ -149,8 +202,7 @@ function Show-RuckusBackupHelp {
     Write-Host "  SkipCertificateCheck defaults to enabled."
     Write-Host ""
     Write-Host "Backup destination:"
-    Write-Host "  No built-in default path is used. First run prompts for OutputRoot if it is not supplied or saved."
-    Write-Host "  Example: D:\SmartZoneBackups\<yyyyMMdd-HHmmss>\"
+    Write-Host "  Prompted on first run or supplied with -OutputRoot. Timestamped run folders are created under that root."
     Write-Host ""
     Write-Host "Common usage:"
     Write-Host "  .\Get-RuckusSmartZoneBackup.ps1"
@@ -173,7 +225,10 @@ function Show-RuckusBackupHelp {
     Write-Host "  -NoDownload               List backups only; do not download."
     Write-Host "  -SkipClusterBackups       Skip Cluster backup listing/download. Useful for testing without huge files."
     Write-Host "  -SkipSwitchBackups        Skip Switch config listing/download."
-    Write-Host "  -MaxDownloadPerCategory   Limit downloads per category. Default: 999."
+    Write-Host "  -MaxDownloadPerCategory   Limit downloads per category after category-specific filtering. Default: 999."
+    Write-Host "  -SwitchConfigsPerDevice   Keep newest N switch config records per device. Default: 2. Use 0 to keep all."
+    Write-Host "  -ClusterBackupsPerBlade   Keep newest N cluster backup records per blade. Default: 1. Use 0 to keep all."
+    Write-Host "  -ClusterRetryCount        Cluster retry count. Default: 0. Cluster backups are opportunistic."
     Write-Host "  -KeepBackupRuns           Keep newest N timestamped backup folders. Default: 1."
     Write-Host "  -PruneOnly                Run retention cleanup only, then exit. Useful for cleaning old test folders."
     Write-Host "  -DebugCapture             Write extra request/response debug files. Use only for troubleshooting."
@@ -466,11 +521,11 @@ function Resolve-Settings {
         $resolvedHost = Read-Host "Enter RUCKUS SmartZone/vSZ host or FQDN"
     }
 
-    if ([string]::IsNullOrWhiteSpace($resolvedOutputRoot)) {
-        do {
-            $rootInput = Read-Host "Enter backup destination root (required; example: D:\SmartZoneBackups)"
-        } while ([string]::IsNullOrWhiteSpace($rootInput))
-        $resolvedOutputRoot = $rootInput
+    while ([string]::IsNullOrWhiteSpace($resolvedOutputRoot)) {
+        $rootInput = Read-Host "Enter backup destination root"
+        if (-not [string]::IsNullOrWhiteSpace($rootInput)) {
+            $resolvedOutputRoot = $rootInput
+        }
     }
 
     # Intentionally do not prompt for or store Port. Default is 8443 unless -Port is supplied for this run.
@@ -881,6 +936,81 @@ function Get-ListItems {
     return @()
 }
 
+function ConvertTo-RecordList {
+    param($Items)
+
+    $records = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Items) { return @() }
+
+    $splitCandidateNames = @(
+        'filename','fileName','name','backupName','backupFileName',
+        'key','backupUUID','backupUuid','uuid','id','backupID','backupId',
+        'filesize','fileSize','size','path','md5','version','createDate','createdDate','backupTime','backupStartTime','startTime',
+        'switchName','switchMac','mac','macAddress','configName'
+    )
+
+    foreach ($item in @($Items)) {
+        if ($null -eq $item) { continue }
+
+        if (($item -is [System.Collections.IEnumerable]) -and -not ($item -is [string]) -and -not ($item -is [System.Collections.IDictionary]) -and -not ($item -is [pscustomobject])) {
+            foreach ($nestedItem in $item) { [void]$records.Add($nestedItem) }
+            continue
+        }
+
+        $props = @($item.PSObject.Properties | Where-Object { $_.MemberType -in @('NoteProperty','Property','AliasProperty') })
+        if ($props.Count -eq 0) {
+            [void]$records.Add($item)
+            continue
+        }
+
+        $splitProps = @()
+        foreach ($p in $props) {
+            if ($splitCandidateNames -notcontains $p.Name) { continue }
+            $v = $p.Value
+            if ($null -eq $v) { continue }
+            if ($v -is [string]) { continue }
+            if (($v -is [System.Collections.IEnumerable]) -and -not ($v -is [System.Collections.IDictionary])) {
+                $arr = @($v)
+                if ($arr.Count -gt 1) {
+                    $splitProps += [pscustomobject]@{ Name = $p.Name; Values = $arr; Count = $arr.Count }
+                }
+            }
+        }
+
+        if ($splitProps.Count -eq 0) {
+            [void]$records.Add($item)
+            continue
+        }
+
+        $max = 0
+        foreach ($sp in $splitProps) { if ($sp.Count -gt $max) { $max = $sp.Count } }
+        if ($max -le 1) {
+            [void]$records.Add($item)
+            continue
+        }
+
+        for ($i = 0; $i -lt $max; $i++) {
+            $h = [ordered]@{}
+            foreach ($p in $props) {
+                $v = $p.Value
+                if ($null -ne $v -and -not ($v -is [string]) -and ($v -is [System.Collections.IEnumerable]) -and -not ($v -is [System.Collections.IDictionary]) -and ($splitCandidateNames -contains $p.Name)) {
+                    $arr = @($v)
+                    if ($arr.Count -gt $i) { $h[$p.Name] = $arr[$i] } else { $h[$p.Name] = $null }
+                }
+                else {
+                    $h[$p.Name] = $v
+                }
+            }
+            [void]$records.Add([pscustomobject]$h)
+        }
+    }
+
+    $arrOut = New-Object 'object[]' $records.Count
+    for ($i = 0; $i -lt $records.Count; $i++) { $arrOut[$i] = $records[$i] }
+    return $arrOut
+}
+
+
 function Get-BackupId {
     param($Item)
     $v = Get-FirstProp -Object $Item -Names @("key", "backupUUID", "backupUuid", "uuid", "id", "backupID", "backupId", "configId", "configID")
@@ -888,13 +1018,80 @@ function Get-BackupId {
     return [string]$v
 }
 
+function ConvertTo-SafeFileName {
+    param(
+        [AllowNull()]
+        [string]$Name,
+        [string]$DefaultName = "backup-file.bak",
+        [int]$MaxLength = 180
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { $Name = $DefaultName }
+
+    $safe = [string]$Name
+
+    # Normalize path separators and all Windows-invalid filename characters.
+    # [IO.Path]::GetInvalidFileNameChars() catches control characters that a simple regex misses.
+    foreach ($ch in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $escaped = [Regex]::Escape([string]$ch)
+        $safe = $safe -replace $escaped, '_'
+    }
+
+    # Be extra defensive for characters that commonly sneak in from appliance-generated names.
+    $safe = $safe -replace '[\x00-\x1F]', '_'
+    $safe = $safe -replace '[\/:*?"<>|]', '_'
+    $safe = $safe -replace '\s+', ' '
+    $safe = $safe.Trim()
+    $safe = $safe.TrimEnd('.', ' ')
+
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = $DefaultName }
+
+    # Windows reserved device names are invalid even with extensions in some contexts.
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($safe)
+    if ($base -match '^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+        $safe = "_$safe"
+    }
+
+    if ($safe.Length -gt $MaxLength) {
+        $ext = [System.IO.Path]::GetExtension($safe)
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($safe)
+        $allowedBaseLength = $MaxLength - $ext.Length
+        if ($allowedBaseLength -lt 20) { $allowedBaseLength = $MaxLength }
+        if ($baseName.Length -gt $allowedBaseLength) { $baseName = $baseName.Substring(0, $allowedBaseLength) }
+        $safe = "$baseName$ext"
+        $safe = $safe.TrimEnd('.', ' ')
+    }
+
+    return $safe
+}
+
 function Get-BackupName {
     param($Item, [string]$Prefix, [string]$Id, [string]$DefaultExtension = ".bak")
     $v = Get-FirstProp -Object $Item -Names @("filename", "fileName", "name", "backupName", "configName")
     if ($null -eq $v -or [string]::IsNullOrWhiteSpace([string]$v)) { $v = "$Prefix-$Id$DefaultExtension" }
-    $safe = [string]$v
-    $safe = $safe -replace '[\\/:*?"<>|]', '_'
-    return $safe
+
+    # Some controller builds return filenames with hidden/control characters, URL-like values,
+    # trailing periods/spaces, or other Windows-hostile punctuation. Do not trust appliance
+    # filenames to be valid Windows filenames.
+    return (ConvertTo-SafeFileName -Name ([string]$v) -DefaultName "$Prefix-$Id$DefaultExtension")
+}
+
+function Join-SafeOutputFilePath {
+    param(
+        [Parameter(Mandatory=$true)][string]$Directory,
+        [Parameter(Mandatory=$true)][string]$FileName,
+        [string]$DefaultName = "backup-file.bak"
+    )
+
+    $safeName = ConvertTo-SafeFileName -Name $FileName -DefaultName $DefaultName
+    try {
+        return (Join-Path -Path $Directory -ChildPath $safeName -ErrorAction Stop)
+    }
+    catch {
+        $fallback = ConvertTo-SafeFileName -Name $DefaultName -DefaultName "backup-file.bak"
+        Add-ErrorLog "Invalid generated output path for '$FileName'. Falling back to '$fallback'. Error: $($_.Exception.Message)"
+        return (Join-Path -Path $Directory -ChildPath $fallback)
+    }
 }
 
 function Add-FileNameSuffix {
@@ -903,7 +1100,7 @@ function Add-FileNameSuffix {
     $dir = [System.IO.Path]::GetDirectoryName($FileName)
     $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
     $ext = [System.IO.Path]::GetExtension($FileName)
-    $newName = "$base$Suffix$ext"
+    $newName = ConvertTo-SafeFileName -Name "$base$Suffix$ext" -DefaultName "backup-file$ext"
     if ([string]::IsNullOrWhiteSpace($dir)) { return $newName }
     return (Join-Path $dir $newName)
 }
@@ -949,7 +1146,8 @@ function Invoke-BackupDownload {
         [System.Collections.Generic.List[object]]$StatusList,
         [bool]$CaptureDebug,
         [int]$AttemptNumber = 1,
-        [string]$AttemptType = "Initial"
+        [string]$AttemptType = "Initial",
+        [bool]$DeletePartialOnFailure = $false
     )
 
     $dir = Split-Path $OutFile -Parent
@@ -1028,6 +1226,20 @@ function Invoke-BackupDownload {
         Add-ErrorLog "Download failed for [$Category] $DisplayName. Attempt=$AttemptNumber Retryable=$retryable Error: $failureReason"
     }
 
+    $partialDeleted = $false
+    $partialDeleteError = $null
+    if (-not $ok -and $DeletePartialOnFailure -and $exists) {
+        try {
+            Remove-Item -Path $OutFile -Force -ErrorAction Stop
+            $partialDeleted = $true
+            Add-RunLog "Deleted incomplete [$Category] file after failed attempt: $OutFile ($bytes bytes)"
+        }
+        catch {
+            $partialDeleteError = $_.Exception.Message
+            Add-ErrorLog "Failed to delete incomplete [$Category] file '$OutFile'. Error: $partialDeleteError"
+        }
+    }
+
     [void]$StatusList.Add([pscustomobject]@{
         Timestamp       = (Get-Date).ToString("o")
         Category        = $Category
@@ -1046,6 +1258,9 @@ function Invoke-BackupDownload {
         Retryable       = $retryable
         Outcome         = $outcome
         ErrorMessage    = $failureReason
+        DeletePartialOnFailure = $DeletePartialOnFailure
+        PartialDeleted  = $partialDeleted
+        PartialDeleteError = $partialDeleteError
     })
 }
 
@@ -1082,9 +1297,212 @@ function Get-CookieHeaderFromSession {
     return (($cookieMap.Values | Sort-Object) -join '; ')
 }
 
+
+function Convert-WebHeaderCollectionToHash {
+    param($Headers)
+
+    $out = [ordered]@{}
+    if ($null -eq $Headers) { return $out }
+
+    try {
+        foreach ($key in $Headers.AllKeys) {
+            if ($null -ne $key) { $out[[string]$key] = [string]$Headers[$key] }
+        }
+    }
+    catch {}
+
+    return $out
+}
+
+function Invoke-ClusterDownloadEndpointProbeRequest {
+    param(
+        [string]$Name,
+        [string]$Method,
+        [string]$Uri,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [int]$TimeoutSeconds = 60,
+        [switch]$UseRange
+    )
+
+    $resp = $null
+    $stream = $null
+    $bytesRead = 0
+    $headersOut = [ordered]@{}
+    $statusCode = $null
+    $statusDescription = $null
+    $rangeHeaderSent = $false
+
+    try {
+        $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Uri)
+        $req.Method = $Method
+        $req.AllowAutoRedirect = $true
+        $req.MaximumAutomaticRedirections = 10
+        $req.Timeout = [Math]::Max(5, $TimeoutSeconds) * 1000
+        $req.ReadWriteTimeout = [Math]::Max(5, $TimeoutSeconds) * 1000
+        $req.Accept = '*/*'
+        $req.Referer = "$script:BaseUri/wsg/"
+        $req.UserAgent = 'Mozilla/5.0 (Windows NT; SmartZoneBackupProbe) PowerShell'
+        $req.Headers['X-Requested-With'] = 'XMLHttpRequest'
+        if ($script:CsrfToken -and -not [string]::IsNullOrWhiteSpace([string]$script:CsrfToken)) {
+            $req.Headers['X-CSRF-Token'] = [string]$script:CsrfToken
+        }
+
+        if ($Session -and $Session.Cookies) {
+            $req.CookieContainer = $Session.Cookies
+        }
+
+        if ($UseRange) {
+            $req.AddRange(0, 0)
+            $rangeHeaderSent = $true
+        }
+
+        $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+        $statusCode = [int]$resp.StatusCode
+        $statusDescription = [string]$resp.StatusDescription
+        $headersOut = Convert-WebHeaderCollectionToHash $resp.Headers
+
+        if ($Method -eq 'GET') {
+            $stream = $resp.GetResponseStream()
+            if ($stream) {
+                $buffer = New-Object byte[] 4096
+                $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+            }
+        }
+
+        return [pscustomobject]@{
+            Name              = $Name
+            Method            = $Method
+            Uri               = $Uri
+            Success           = $true
+            StatusCode        = $statusCode
+            StatusDescription = $statusDescription
+            Headers           = $headersOut
+            RangeHeaderSent   = $rangeHeaderSent
+            BytesRead         = $bytesRead
+            ErrorMessage      = $null
+        }
+    }
+    catch {
+        $ex = $_.Exception
+        try {
+            if ($ex.Response) {
+                $resp = [System.Net.HttpWebResponse]$ex.Response
+                $statusCode = [int]$resp.StatusCode
+                $statusDescription = [string]$resp.StatusDescription
+                $headersOut = Convert-WebHeaderCollectionToHash $resp.Headers
+            }
+        }
+        catch {}
+
+        return [pscustomobject]@{
+            Name              = $Name
+            Method            = $Method
+            Uri               = $Uri
+            Success           = $false
+            StatusCode        = $statusCode
+            StatusDescription = $statusDescription
+            Headers           = $headersOut
+            RangeHeaderSent   = $rangeHeaderSent
+            BytesRead         = $bytesRead
+            ErrorMessage      = $ex.Message
+        }
+    }
+    finally {
+        try { if ($stream) { $stream.Close() } } catch {}
+        try { if ($resp) { $resp.Close() } } catch {}
+    }
+}
+
+function Test-ClusterDownloadEndpoints {
+    param(
+        [object]$Tasks,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [string]$OutputPath,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $Tasks = @(ConvertTo-PlainObjectArray -InputObject $Tasks)
+    $results = New-Object System.Collections.Generic.List[object]
+
+    if ($null -eq $Tasks -or $Tasks.Count -lt 1) {
+        Add-RunLog 'No [cluster] endpoint diagnostics queued.'
+        Write-SafeJson -Path (Join-Path $OutputPath 'logs\cluster-download-probes.json') -Object @()
+        return @()
+    }
+
+    Add-RunLog "Starting [cluster] endpoint diagnostics for $($Tasks.Count) download endpoint(s)."
+
+    foreach ($task in $Tasks) {
+        $safeId = ([string]$task.Id) -replace '[^a-zA-Z0-9\._-]', '_'
+        $head = Invoke-ClusterDownloadEndpointProbeRequest -Name "cluster-head-$safeId" -Method 'HEAD' -Uri $task.Uri -Session $Session -TimeoutSeconds $TimeoutSeconds
+        $range = Invoke-ClusterDownloadEndpointProbeRequest -Name "cluster-range-$safeId" -Method 'GET' -Uri $task.Uri -Session $Session -TimeoutSeconds $TimeoutSeconds -UseRange
+
+        $acceptRanges = $null
+        $contentLength = $null
+        $contentRange = $null
+        try { $acceptRanges = [string]$head.Headers['Accept-Ranges'] } catch {}
+        if ([string]::IsNullOrWhiteSpace($acceptRanges)) { try { $acceptRanges = [string]$range.Headers['Accept-Ranges'] } catch {} }
+        try { $contentLength = [string]$head.Headers['Content-Length'] } catch {}
+        if ([string]::IsNullOrWhiteSpace($contentLength)) { try { $contentLength = [string]$range.Headers['Content-Length'] } catch {} }
+        try { $contentRange = [string]$range.Headers['Content-Range'] } catch {}
+
+        $rangeSupported = $false
+        if ($range.Success -and [int]$range.StatusCode -eq 206) { $rangeSupported = $true }
+        elseif (-not [string]::IsNullOrWhiteSpace($contentRange)) { $rangeSupported = $true }
+        elseif (-not [string]::IsNullOrWhiteSpace($acceptRanges) -and $acceptRanges -match 'bytes') { $rangeSupported = $true }
+
+        $probeResult = [pscustomobject]@{
+            Timestamp          = (Get-Date).ToString('o')
+            Category           = $task.Category
+            Id                 = $task.Id
+            DisplayName        = $task.DisplayName
+            Uri                = $task.Uri
+            ExpectedSize       = $task.ExpectedSize
+            HeadSuccess        = $head.Success
+            HeadStatusCode     = $head.StatusCode
+            HeadError          = $head.ErrorMessage
+            RangeSuccess       = $range.Success
+            RangeStatusCode    = $range.StatusCode
+            RangeError         = $range.ErrorMessage
+            RangeBytesRead     = $range.BytesRead
+            AcceptRanges       = $acceptRanges
+            ContentLength      = $contentLength
+            ContentRange       = $contentRange
+            RangeSupported     = $rangeSupported
+            HeadHeaders        = $head.Headers
+            RangeHeaders       = $range.Headers
+        }
+        [void]$results.Add($probeResult)
+
+        Add-RunLog "Cluster probe [$($task.DisplayName)]: HEAD=$($head.StatusCode) RangeGET=$($range.StatusCode) RangeSupported=$rangeSupported AcceptRanges=$acceptRanges ContentLength=$contentLength ContentRange=$contentRange"
+    }
+
+    $arr = New-Object 'object[]' $results.Count
+    for ($i = 0; $i -lt $results.Count; $i++) { $arr[$i] = $results[$i] }
+    Write-SafeJson -Path (Join-Path $OutputPath 'logs\cluster-download-probes.json') -Object $arr
+    Add-RunLog "Cluster endpoint diagnostics written: $OutputPath\logs\cluster-download-probes.json"
+    return $arr
+}
+
 function New-DownloadTask {
-    param([string]$Category,[string]$Id,[string]$DisplayName,[string]$Uri,[string]$OutFile,[object]$ExpectedSize)
-    return [pscustomobject]@{ Category=$Category; Id=$Id; DisplayName=$DisplayName; Uri=$Uri; OutFile=$OutFile; ExpectedSize=$ExpectedSize }
+    param(
+        [string]$Category,
+        [string]$Id,
+        [string]$DisplayName,
+        [string]$Uri,
+        [string]$OutFile,
+        [object]$ExpectedSize,
+        [bool]$DeletePartialOnFailure = $false
+    )
+    return [pscustomobject]@{
+        Category=$Category
+        Id=$Id
+        DisplayName=$DisplayName
+        Uri=$Uri
+        OutFile=$OutFile
+        ExpectedSize=$ExpectedSize
+        DeletePartialOnFailure=$DeletePartialOnFailure
+    }
 }
 
 function Invoke-DownloadTaskSequential {
@@ -1097,7 +1515,23 @@ function Invoke-DownloadTaskSequential {
         [int]$AttemptNumber = 1,
         [string]$AttemptType = "Initial"
     )
-    Invoke-BackupDownload -Category $Task.Category -Id $Task.Id -DisplayName $Task.DisplayName -Uri $Task.Uri -OutFile $Task.OutFile -ExpectedSize $Task.ExpectedSize -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug -AttemptNumber $AttemptNumber -AttemptType $AttemptType
+    $deletePartial = $false
+    try {
+        if ($Task.PSObject.Properties['DeletePartialOnFailure'] -and $Task.DeletePartialOnFailure -eq $true) { $deletePartial = $true }
+    } catch {}
+
+    try {
+        $null = [System.IO.Path]::GetFullPath([string]$Task.OutFile)
+    }
+    catch {
+        $fallbackName = ConvertTo-SafeFileName -Name ([string]$Task.DisplayName) -DefaultName ("$($Task.Category)-$($Task.Id).bak")
+        $fallbackOutFile = Join-SafeOutputFilePath -Directory $OutputPath -FileName $fallbackName -DefaultName ("$($Task.Category)-$($Task.Id).bak")
+        Add-ErrorLog "Invalid OutFile path before download for [$($Task.Category)] '$($Task.DisplayName)'. Original='$($Task.OutFile)' Fallback='$fallbackOutFile'. Error: $($_.Exception.Message)"
+        try { $Task.OutFile = $fallbackOutFile } catch {}
+    }
+
+    Add-RunLog "Download task prepared [$($Task.Category)] DisplayName='$($Task.DisplayName)' OutFile='$($Task.OutFile)' Attempt=$AttemptNumber Type=$AttemptType"
+    Invoke-BackupDownload -Category $Task.Category -Id $Task.Id -DisplayName $Task.DisplayName -Uri $Task.Uri -OutFile $Task.OutFile -ExpectedSize $Task.ExpectedSize -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug -AttemptNumber $AttemptNumber -AttemptType $AttemptType -DeletePartialOnFailure:$deletePartial
 }
 
 function Get-DownloadTaskKey {
@@ -1181,7 +1615,7 @@ function Invoke-DownloadTaskBatch {
         [int]$RetryDelaySeconds = 10
     )
 
-    $Tasks = ConvertTo-PlainObjectArray -InputObject $Tasks
+    $Tasks = @(ConvertTo-PlainObjectArray -InputObject $Tasks)
     if ($null -eq $Tasks -or $Tasks.Count -lt 1) {
         Add-RunLog "No [$Category] downloads queued."
         return
@@ -1217,6 +1651,152 @@ function Invoke-DownloadTaskBatch {
     }
 }
 
+
+
+function Get-SwitchConfigDeviceKey {
+    param($Item)
+
+    # Prefer the rendered backup filename/name first because some controller versions expose
+    # generic or missing switch identity fields while the filename still contains the device identity.
+    $id = Get-SwitchConfigId -Item $Item
+    $name = Get-SwitchConfigName -Item $Item -Id $id
+    if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+        $base = [System.IO.Path]::GetFileNameWithoutExtension([string]$name)
+        $base = $base.Trim()
+        # Names commonly look like DEVICE-MAC_OR_ID-1783063807583.txt. Strip the final timestamp.
+        if ($base -match '^(?<device>.+)-\d{10,}$') { return $Matches['device'].ToLowerInvariant() }
+        # If an ID got appended but no timestamp is present, use the base rather than grouping everything together.
+        if (-not [string]::IsNullOrWhiteSpace($base)) { return $base.ToLowerInvariant() }
+    }
+
+    $key = Get-FirstProp -Object $Item -Names @(
+        'switchMac','macAddress','macAddressString','mac','serialNumber','serial','switchId','switchUUID','switchUuid','switchGuid','switchName'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$key)) {
+        return ([string]$key).Trim().ToLowerInvariant()
+    }
+
+    return ([string]$id).Trim().ToLowerInvariant()
+}
+
+function Get-SwitchConfigSortValue {
+    param($Item)
+
+    $v = Get-FirstProp -Object $Item -Names @(
+        'backupStartTime','backupTime','startTime','createdTime','createTime','lastModifiedTime','modifiedTime','timestamp','timeStamp','id','configId'
+    )
+
+    if ($null -eq $v) { return 0 }
+    $text = ([string]$v).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+
+    $n = 0L
+    if ([Int64]::TryParse($text, [ref]$n)) { return $n }
+
+    $dt = [DateTime]::MinValue
+    if ([DateTime]::TryParse($text, [ref]$dt)) { return $dt.Ticks }
+
+    return 0
+}
+
+function Select-NewestSwitchConfigItemsPerDevice {
+    param(
+        [object]$Items,
+        [int]$PerDevice = 2
+    )
+
+    $itemsArray = @(ConvertTo-PlainObjectArray -InputObject $Items)
+    if ($PerDevice -le 0) { return $itemsArray }
+    if ($itemsArray.Count -lt 1) { return @() }
+
+    $groups = @{}
+    foreach ($item in $itemsArray) {
+        if ($null -eq $item) { continue }
+        $key = Get-SwitchConfigDeviceKey -Item $item
+        if ([string]::IsNullOrWhiteSpace([string]$key)) { $key = 'unknown-device' }
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = New-Object System.Collections.Generic.List[object] }
+        [void]$groups[$key].Add($item)
+    }
+
+    $selected = New-Object System.Collections.Generic.List[object]
+    foreach ($key in $groups.Keys) {
+        $sorted = @($groups[$key] | Sort-Object -Property @{ Expression = { Get-SwitchConfigSortValue -Item $_ }; Descending = $true })
+        $take = [Math]::Min($PerDevice, $sorted.Count)
+        for ($i = 0; $i -lt $take; $i++) { [void]$selected.Add($sorted[$i]) }
+    }
+
+    $final = @($selected | Sort-Object -Property @{ Expression = { Get-SwitchConfigSortValue -Item $_ }; Descending = $true })
+    return $final
+}
+
+
+function Get-ClusterBackupSortValue {
+    param($Item)
+
+    $v = Get-FirstProp -Object $Item -Names @(
+        'backupStartTime','backupTime','startTime','createdTime','createTime','lastModifiedTime','modifiedTime','timestamp','timeStamp','backupID','backupId','id'
+    )
+
+    if ($null -eq $v) { return 0L }
+
+    try {
+        if ($v -is [datetime]) { return [int64]([DateTimeOffset]$v).ToUnixTimeMilliseconds() }
+        $text = [string]$v
+        $num = 0L
+        if ([int64]::TryParse($text, [ref]$num)) { return $num }
+        $dt = [datetime]::Parse($text)
+        return [int64]([DateTimeOffset]$dt).ToUnixTimeMilliseconds()
+    }
+    catch { return 0L }
+}
+
+function Select-NewestClusterBackupItemsPerBlade {
+    param(
+        [object]$Items,
+        [int]$PerBlade = 1
+    )
+
+    $itemsArray = @(ConvertTo-PlainObjectArray -InputObject $Items)
+    if ($PerBlade -le 0) { return $itemsArray }
+    if ($itemsArray.Count -lt 1) { return @() }
+
+    $sorted = @($itemsArray | Sort-Object -Property @{ Expression = { Get-ClusterBackupSortValue -Item $_ }; Descending = $true })
+    $counts = @{}
+    $selected = New-Object System.Collections.Generic.List[object]
+
+    foreach ($item in $sorted) {
+        if ($null -eq $item) { continue }
+        $bladeUuids = @(Get-ClusterBladeUuids -Item $item)
+        if ($bladeUuids.Count -lt 1) {
+            # If the record does not expose blade UUIDs, treat it as its own bucket so it can still be attempted.
+            $id = Get-BackupId -Item $item
+            if ([string]::IsNullOrWhiteSpace([string]$id)) { $id = 'unknown-cluster-backup' }
+            $bladeUuids = @($id)
+        }
+
+        $shouldInclude = $false
+        foreach ($bladeUuid in $bladeUuids) {
+            $key = ([string]$bladeUuid).Trim().ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+            if ([int]$counts[$key] -lt $PerBlade) { $shouldInclude = $true }
+        }
+
+        if ($shouldInclude) {
+            [void]$selected.Add($item)
+            foreach ($bladeUuid in $bladeUuids) {
+                $key = ([string]$bladeUuid).Trim().ToLowerInvariant()
+                if ([string]::IsNullOrWhiteSpace($key)) { continue }
+                if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+                $counts[$key] = [int]$counts[$key] + 1
+            }
+        }
+    }
+
+    $final = @($selected | Sort-Object -Property @{ Expression = { Get-ClusterBackupSortValue -Item $_ }; Descending = $true })
+    return $final
+}
 
 function New-SwitchConfigQueryBody {
     param([int]$Limit = 30000)
@@ -1275,6 +1855,7 @@ function Get-SwitchConfigName {
 $effectiveResetCred = ($ResetSavedCredential -or $UpdateCreds)
 $settings = Resolve-Settings -InputBaseHost $BaseHost -InputOutputRoot $OutputRoot -InputPort $Port -InputSkipCertificateCheck:$SkipCertificateCheck -InputNoSkipCertificateCheck:$NoSkipCertificateCheck -InputConfigPath $ConfigPath -InputResetSavedConfig:$ResetSavedConfig
 $script:EffectiveSkipCertificateCheck = [bool]$settings.SkipCertificateCheck
+$script:RequestTimeoutSeconds = [int]$RequestTimeoutSeconds
 Enable-CertBypassIfNeeded -Enable $script:EffectiveSkipCertificateCheck
 
 $script:BaseUri = "https://$($settings.BaseHost):$($settings.Port)"
@@ -1285,10 +1866,11 @@ if ($PruneOnly) {
     if (-not (Test-Path $pruneLogRoot)) { New-Item -ItemType Directory -Path $pruneLogRoot -Force | Out-Null }
     $script:RunLogPath = Join-Path $pruneLogRoot "retention-prune.log"
     $script:ErrorLogPath = Join-Path $pruneLogRoot "retention-prune-errors.log"
-    Add-RunLog "RUCKUS Backup API Downloader v1.30.4 - PruneOnly"
+    Add-RunLog "RUCKUS Backup API Downloader v$script:ScriptVersion - PruneOnly"
     Add-RunLog "Output root: $($settings.OutputRoot)"
     Add-RunLog "Retention: keep newest $KeepBackupRuns backup run folder(s)"
-    Add-RunLog "Download retry handling: RetryCount=$RetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
+    Add-RunLog "Download retry handling: RetryCount=$RetryCount ClusterRetryCount=$ClusterRetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
+    Add-RunLog "Cluster diagnostics: ClusterDiagnosticsOnly=$([bool]$ClusterDiagnosticsOnly) NoClusterHeaderProbe=$([bool]$NoClusterHeaderProbe) ClusterProbeTimeoutSeconds=$ClusterProbeTimeoutSeconds"
     Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
     Add-RunLog "PruneOnly complete."
     return
@@ -1308,13 +1890,15 @@ $switchItems = @()
 $downloadStatusArray = @()
 
 try {
-    Add-RunLog "RUCKUS Backup API Downloader v1.30.4"
+    Add-RunLog "RUCKUS Backup API Downloader v$script:ScriptVersion"
     Add-RunLog "Target: $script:BaseUri"
     Add-RunLog "Output: $outPath"
     Add-RunLog "Output root: $($settings.OutputRoot)"
     Add-RunLog "Retention: keep newest $KeepBackupRuns backup run folder(s)"
     Add-RunLog "Saved config: $($settings.ConfigPath)"
     Add-RunLog "SkipCertificateCheck: $($settings.SkipCertificateCheck)"
+    Add-RunLog "Download retry handling: RetryCount=$RetryCount ClusterRetryCount=$ClusterRetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
+    Add-RunLog "Cluster diagnostics: ClusterDiagnosticsOnly=$([bool]$ClusterDiagnosticsOnly) NoClusterHeaderProbe=$([bool]$NoClusterHeaderProbe) ClusterProbeTimeoutSeconds=$ClusterProbeTimeoutSeconds"
 
     $credResult = Get-SavedOrPromptCredential -HostName $settings.BaseHost -PortNumber $settings.Port -InputCredentialPath $CredentialPath -InputResetSavedCredential:$effectiveResetCred
     if ($credResult.Loaded) { Add-RunLog "Using saved credential from: $($credResult.Path)" } else { Add-RunLog "Saved credential using Windows DPAPI for this Windows user: $($credResult.Path)" }
@@ -1353,7 +1937,7 @@ try {
     $configResp = Invoke-RuckusRequest -Name "config-list" -Method GET -Uri "$script:BaseUri/wsg/api/scg/backup/config" -Session $session -Headers (New-RuckusAjaxHeaders) -OutputPath $outPath -CaptureDebug:$DebugCapture
     $configJson = Convert-ResponseJson -Response $configResp
     if ($configJson) { Write-SafeJson -Path (Join-Path $outPath "logs\config-list.json") -Object $configJson }
-    $configItems = @(Get-ListItems -Json $configJson)
+    $configItems = @(ConvertTo-RecordList -Items (Get-ListItems -Json $configJson))
     Add-RunLog "System Configuration backups found: $($configItems.Count)"
 
     $clusterItems = @()
@@ -1365,7 +1949,7 @@ try {
         $clusterResp = Invoke-RuckusRequest -Name "cluster-list" -Method GET -Uri "$script:BaseUri/wsg/api/scg/backup/cluster" -Session $session -Headers (New-RuckusAjaxHeaders) -OutputPath $outPath -CaptureDebug:$DebugCapture
         $clusterJson = Convert-ResponseJson -Response $clusterResp
         if ($clusterJson) { Write-SafeJson -Path (Join-Path $outPath "logs\cluster-list.json") -Object $clusterJson }
-        $clusterItems = @(Get-ListItems -Json $clusterJson)
+        $clusterItems = @(ConvertTo-RecordList -Items (Get-ListItems -Json $clusterJson))
         Add-RunLog "Cluster backups found: $($clusterItems.Count)"
     }
 
@@ -1432,7 +2016,16 @@ try {
                 $switchJson = Convert-ResponseJson -Response $switchResp
                 if ($switchJson) {
                     Write-SafeJson -Path (Join-Path $outPath "logs\switch-list.json") -Object $switchJson
-                    $switchItems = @(Get-ListItems -Json $switchJson)
+                    $rawSwitchItems = @(ConvertTo-RecordList -Items (Get-ListItems -Json $switchJson))
+                    $rawSwitchCount = $rawSwitchItems.Count
+                    $switchItems = @(Select-NewestSwitchConfigItemsPerDevice -Items $rawSwitchItems -PerDevice $SwitchConfigsPerDevice)
+                    if ($SwitchConfigsPerDevice -gt 0) {
+                        Add-RunLog "Switch configuration records filtered: $rawSwitchCount found, $($switchItems.Count) selected using newest $SwitchConfigsPerDevice per device."
+                    }
+                    else {
+                        Add-RunLog "Switch configuration per-device filtering disabled. Keeping all $rawSwitchCount switch configuration record(s)."
+                    }
+                    Write-SafeJson -Path (Join-Path $outPath "logs\switch-list-selected.json") -Object $switchItems
                     $switchConfigBaseUri = "$script:BaseUri/switchm/api/v13_1/switchconfig"
                     break
                 }
@@ -1460,12 +2053,17 @@ try {
             if ([string]::IsNullOrWhiteSpace($id)) { Add-ErrorLog "Skipping config item with no backup ID/key."; continue }
             $name = Get-BackupName -Item $item -Prefix "system-config" -Id $id -DefaultExtension ".bak"
             $size = Get-BackupSize -Item $item
-            $outFile = Join-Path $outPath $name
+            $outFile = Join-SafeOutputFilePath -Directory $outPath -FileName $name -DefaultName "system-config-$id.bak"
             $downloadUri = "$script:BaseUri/wsg/api/scg/backup/config/download?backupUUID=$([System.Uri]::EscapeDataString($id))&timezone=$TimezoneOffset"
             [void]$configTasks.Add((New-DownloadTask -Category "system-config" -Id $id -DisplayName $name -Uri $downloadUri -OutFile $outFile -ExpectedSize $size))
             $count++
         }
-        Invoke-DownloadTaskBatch -Category "system-config" -Tasks $configTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+        if ($ClusterDiagnosticsOnly) {
+            Add-RunLog "ClusterDiagnosticsOnly selected. Skipping system-config downloads."
+        }
+        else {
+            Invoke-DownloadTaskBatch -Category "system-config" -Tasks $configTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+        }
 
         $switchTasks = New-Object System.Collections.Generic.List[object]
         if ($switchConfigBaseUri) {
@@ -1475,17 +2073,30 @@ try {
                 $id = Get-SwitchConfigId -Item $item
                 if ([string]::IsNullOrWhiteSpace($id)) { Add-ErrorLog "Skipping switch config item with no config ID."; continue }
                 $name = Get-SwitchConfigName -Item $item -Id $id
-                $outFile = Join-Path $outPath $name
+                $outFile = Join-SafeOutputFilePath -Directory $outPath -FileName $name -DefaultName "switch-config-$id.txt"
                 $downloadUri = "$switchConfigBaseUri/download/$([System.Uri]::EscapeDataString($id))"
                 [void]$switchTasks.Add((New-DownloadTask -Category "switch-config" -Id $id -DisplayName $name -Uri $downloadUri -OutFile $outFile -ExpectedSize $null))
                 $count++
             }
         }
-        Invoke-DownloadTaskBatch -Category "switch-config" -Tasks $switchTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+        if ($ClusterDiagnosticsOnly) {
+            Add-RunLog "ClusterDiagnosticsOnly selected. Skipping switch-config downloads."
+        }
+        else {
+            Invoke-DownloadTaskBatch -Category "switch-config" -Tasks $switchTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+        }
 
         $clusterTasks = New-Object System.Collections.Generic.List[object]
+        $rawClusterCount = @($clusterItems).Count
+        $selectedClusterItems = @(Select-NewestClusterBackupItemsPerBlade -Items $clusterItems -PerBlade $ClusterBackupsPerBlade)
+        if ($ClusterBackupsPerBlade -gt 0) {
+            Add-RunLog "Cluster backup records filtered: $rawClusterCount found, $($selectedClusterItems.Count) selected using newest $ClusterBackupsPerBlade per blade."
+        }
+        else {
+            Add-RunLog "Cluster backup filtering disabled. All $rawClusterCount discovered cluster backup records are eligible."
+        }
         $count = 0
-        foreach ($item in $clusterItems) {
+        foreach ($item in $selectedClusterItems) {
             if ($count -ge $MaxDownloadPerCategory) { break }
             $id = Get-BackupId -Item $item
             if ([string]::IsNullOrWhiteSpace($id)) { Add-ErrorLog "Skipping cluster item with no backup ID."; continue }
@@ -1496,16 +2107,28 @@ try {
             $bladeIndex = 0
             foreach ($bladeUuid in $bladeUuids) {
                 if ([string]::IsNullOrWhiteSpace($bladeUuid)) { continue }
-                $suffix = if ($bladeUuids.Count -gt 1) { "-" + (($bladeUuid -replace '[\\/:*?"<>|]', '_')) } else { "" }
+                $suffix = if ($bladeUuids.Count -gt 1) { "-" + (ConvertTo-SafeFileName -Name ([string]$bladeUuid) -DefaultName 'blade') } else { "" }
                 $clusterFileName = Add-FileNameSuffix -FileName $name -Suffix $suffix
-                $outFile = Join-Path $outPath $clusterFileName
+                $outFile = Join-SafeOutputFilePath -Directory $outPath -FileName $clusterFileName -DefaultName "cluster-$id-$bladeIndex.bak"
                 $downloadUri = "$script:BaseUri/wsg/api/scg/backup/cluster/downloadagent?bladeUUID=$([System.Uri]::EscapeDataString($bladeUuid))&backupUUID=$([System.Uri]::EscapeDataString($id))&timezone=$TimezoneOffset"
-                [void]$clusterTasks.Add((New-DownloadTask -Category "cluster" -Id "$id-$bladeIndex" -DisplayName "$name blade $bladeUuid" -Uri $downloadUri -OutFile $outFile -ExpectedSize $size))
+                [void]$clusterTasks.Add((New-DownloadTask -Category "cluster" -Id "$id-$bladeIndex" -DisplayName "$name blade $bladeUuid" -Uri $downloadUri -OutFile $outFile -ExpectedSize $size -DeletePartialOnFailure $true))
                 $bladeIndex++
             }
             $count++
         }
-        Invoke-DownloadTaskBatch -Category "cluster" -Tasks $clusterTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+        if (-not $NoClusterHeaderProbe) {
+            Test-ClusterDownloadEndpoints -Tasks $clusterTasks -Session $session -OutputPath $outPath -TimeoutSeconds $ClusterProbeTimeoutSeconds | Out-Null
+        }
+        else {
+            Add-RunLog "NoClusterHeaderProbe selected. Skipping cluster endpoint diagnostics."
+        }
+
+        if ($ClusterDiagnosticsOnly) {
+            Add-RunLog "ClusterDiagnosticsOnly selected. Skipping cluster downloads after endpoint diagnostics."
+        }
+        else {
+            Invoke-DownloadTaskBatch -Category "cluster" -Tasks $clusterTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $ClusterRetryCount -RetryDelaySeconds $RetryDelaySeconds
+        }
     }
     else {
         Add-RunLog "NoDownload selected. Listing completed without downloading files."
@@ -1646,6 +2269,12 @@ try {
         $statusMessage = "SmartZone backup listing completed. NoDownload was selected."
         Add-RunLog "NoDownload selected. Retention cleanup skipped."
     }
+    elseif ($ClusterDiagnosticsOnly) {
+        $runStatus = "Success"
+        $exitCode = 0
+        $statusMessage = "SmartZone cluster endpoint diagnostics completed. No backup files were downloaded."
+        Add-RunLog "ClusterDiagnosticsOnly selected. Retention cleanup skipped because this was a diagnostic run."
+    }
     elseif ($attempts -eq 0) {
         $runStatus = "Failure"
         $exitCode = 1
@@ -1653,10 +2282,25 @@ try {
         Add-RunLog "No download attempts were made. Retention cleanup skipped."
     }
     elseif ($finalFailCount -gt 0) {
+        $nonClusterFailureCount = 0
+        foreach ($failedItem in @($failedItems)) {
+            try {
+                if ([string]$failedItem.Category -ne "cluster") { $nonClusterFailureCount++ }
+            } catch { $nonClusterFailureCount++ }
+        }
+
         $runStatus = "PartialFailure"
         $exitCode = 2
-        $statusMessage = "SmartZone backup partially failed. One or more files failed to download."
-        Add-RunLog "One or more final file downloads failed after recovery attempts. Retention cleanup skipped to preserve older backup runs."
+
+        if ($nonClusterFailureCount -eq 0) {
+            $statusMessage = "SmartZone backup partially completed. Cluster backup download failed, but cluster backups are treated as opportunistic."
+            Add-RunLog "Only cluster backup downloads failed. Incomplete cluster files were deleted where present. Retention cleanup will still run because system and switch backup handling completed without final download failures."
+            Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
+        }
+        else {
+            $statusMessage = "SmartZone backup partially failed. One or more required files failed to download."
+            Add-RunLog "One or more non-cluster final file downloads failed after recovery attempts. Retention cleanup skipped to preserve older backup runs."
+        }
     }
     elseif ($finalUnavailableCount -gt 0) {
         $runStatus = "PartialFailure"

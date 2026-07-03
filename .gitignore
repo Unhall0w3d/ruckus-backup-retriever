@@ -1,24 +1,23 @@
-# Runtime output
+# Generated backup outputs
 *.bak
 *.zip
-*.har
+*.tar
+*.gz
+*.7z
+*.txt
+
+# Runtime state / logs / captures
+logs/
 *.log
-*.json
+*status*.json
+settings.json
 *.credential.xml
-
-# Backup output folders
-backups/
-SmartZoneBackups/
-RuckusBackupApiProbe/
-
-# PowerShell/debug artifacts
-*.ps1xml
-*.clixml
-*.tmp
+*.har
+*.trace
 *.debug
 
-# OS/editor
-.DS_Store
+# Windows / editors
 Thumbs.db
+Desktop.ini
 .vscode/
 .idea/

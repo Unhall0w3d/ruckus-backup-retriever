@@ -1,35 +1,52 @@
 # Changelog
 
-## 1.30.5
+## 1.31.7
 
-- Public repository refresh based on v1.30.4 behavior.
-- Removes environment-specific default backup path from first-run prompt/help text.
-- Keeps retry handling for failed, empty, timed-out, and size-mismatched downloads.
-- Keeps `UnavailableFromController` classification for Switch Configuration records that return empty content after retries.
-- Keeps retention behavior that still runs when only unavailable Switch Configuration records remain.
-- Updates README, rollout guide, troubleshooting guide, and scheduled task example.
+- Public repository refresh based on tested v1.31.6 behavior.
+- Removes environment-specific default backup destination from first-run prompting and help text.
+- Updates README, requirements, rollout guide, troubleshooting guide, and examples for v1.31.x behavior.
 
-## 1.30.4
+## 1.31.6
 
-- Allows retention cleanup to run when only `UnavailableFromController` Switch Configuration records remain.
-- Retention remains skipped when actual final download failures remain after retries.
+- Fixes PowerShell 5.1 array wrapping in normalized lists and download task batches.
+- Fixes download batches receiving wrapped arrays instead of task objects.
 
-## 1.30.3
+## 1.31.5
 
-- Separates empty Switch Configuration download responses into `UnavailableFromController`.
-- Adds unavailable counts to download/status summaries.
+- Normalizes API list responses that are returned as one object with array-valued properties.
+- Fixes controllers that return System Configuration, Cluster, or Switch Configuration records in a vectorized shape.
 
-## 1.30.2
+## 1.31.4
 
-- Fixes retry array handling for Windows PowerShell 5.1.
-- Updates runtime banner/version logging.
+- Adds defensive output path construction and pre-download task logging.
 
-## 1.30.1
+## 1.31.3
 
-- Fixes PowerShell 5.1 parser issue in retry round logging.
+- Improves Windows-safe filename handling.
+- Improves Switch Configuration grouping for environments with different metadata shapes.
 
-## 1.30.0
+## 1.31.2
+
+- Treats Cluster backups as opportunistic.
+- Deletes incomplete Cluster backup files on failure.
+- Adds `ClusterRetryCount`, default `0`.
+- Adds `ClusterBackupsPerBlade`, default `1`.
+- Allows retention to run when only optional Cluster backups fail.
+
+## 1.31.1
+
+- Adds `SwitchConfigsPerDevice`, default `2`.
+- Keeps only the newest N Switch Configuration records per device by default.
+- Fixes Cluster diagnostics array handling when one endpoint is queued.
+
+## 1.31.0
+
+- Adds Cluster endpoint diagnostics.
+- Adds `ClusterDiagnosticsOnly`, `NoClusterHeaderProbe`, and `ClusterProbeTimeoutSeconds`.
+- Applies `RequestTimeoutSeconds` to web requests.
+
+## 1.30.x
 
 - Adds retry handling for failed, empty, timed-out, and size-mismatched downloads.
-- Adds `RetryCount`, `RetryDelaySeconds`, and `RequestTimeoutSeconds` parameters.
-- Adds clearer download failure metadata.
+- Adds `UnavailableFromController` classification for Switch Configuration records returning empty content.
+- Allows retention when only unavailable Switch Configuration records remain.
