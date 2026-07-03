@@ -1,12 +1,12 @@
 # Rollout Guide
 
-This guide describes how to deploy `Get-RuckusSmartZoneBackup.ps1` on a Windows machine and schedule it to run weekly.
+This guide describes how to deploy `Get-RuckusSmartZoneBackup.ps1` on a Windows host and schedule it to run weekly.
 
 ## 1. Choose the Windows host
 
-Use a Windows server, workstation, or management VM that has HTTPS access to the SmartZone/vSZ web interface.
+Use a Windows server, workstation, management VM, or jumpbox that has HTTPS access to the SmartZone/vSZ web interface.
 
-The host should have enough local or mapped storage for the expected backup size, especially if Cluster backups are large.
+The host should have enough local or mapped storage for the expected backup size. Cluster backups can be large, so confirm storage before scheduling a full run. Yes, finding this out during the first production backup is technically a learning experience, but not a good one.
 
 ## 2. Copy the script
 
@@ -37,17 +37,15 @@ This does three things:
 
 1. Prompts for the SmartZone/vSZ host or FQDN.
 2. Prompts for the backup destination root.
-3. Prompts for SmartZone/vSZ web UI credentials and saves them encrypted for the current Windows user.
+3. Prompts for SmartZone/vSZ credentials and saves them encrypted for the current Windows user.
 
-The backup destination root is required. There is no default path. Example:
+There is no built-in default backup destination. Example:
 
 ```text
 D:\SmartZoneBackups
 ```
 
-The `-SkipClusterBackups` switch avoids downloading large Cluster backups during the first test.
-
-The `-MaxDownloadPerCategory 1` switch downloads at most one item from each enabled category.
+The `-SkipClusterBackups` switch avoids downloading large Cluster backups during the first test. The `-MaxDownloadPerCategory 1` switch downloads at most one item from each enabled category.
 
 ## 4. Validate the test result
 
@@ -60,15 +58,13 @@ Get-Content "D:\SmartZoneBackups\last-run-status.json" -Raw
 
 Replace `D:\SmartZoneBackups` with the backup destination root selected during setup.
 
-The status should be `Success` if the limited test completed successfully.
-
 ## 5. Run a full manual backup
 
 After the limited test succeeds, run the full backup manually once:
 
 ```powershell
 cd C:\Scripts
-.\Get-RuckusSmartZoneBackup.ps1
+.\Get-RuckusSmartZoneBackup.ps1 -RetryCount 2 -RetryDelaySeconds 15 -RequestTimeoutSeconds 14400
 ```
 
 This verifies the full production workflow, including Cluster backups if available.
@@ -81,16 +77,16 @@ A sample helper script is provided:
 examples\Register-SmartZoneBackupTask.ps1
 ```
 
-Review it before running. The default task runs every Monday at 6:00 AM.
+Review it before running.
 
 From an elevated PowerShell prompt:
 
 ```powershell
 cd C:\Path\To\Repo\examples
-.\Register-SmartZoneBackupTask.ps1
+.\Register-SmartZoneBackupTask.ps1 -DayOfWeek Monday -At "09:00"
 ```
 
-The task should run as the same Windows user that completed the first successful setup run. This matters because saved credentials are encrypted using Windows DPAPI for that user and machine.
+The task should run as the same Windows user that completed the first successful setup run. Saved credentials are encrypted using Windows DPAPI for that user and machine.
 
 ## 7. Test the scheduled task
 
@@ -133,5 +129,7 @@ Reset saved credentials:
 - Keep the script in a stable location, such as `C:\Scripts`.
 - Do not schedule the first-run limited test command for production.
 - The production scheduled task should normally run the script without `-SkipClusterBackups` or `-MaxDownloadPerCategory`.
-- Confirm backup storage has enough free space for Cluster backups.
+- For large Cluster backups, consider using `-RequestTimeoutSeconds 14400`.
 - Monitor `last-run-status.json`, Windows Task Scheduler history, and the run logs under each timestamped folder.
+- `UnavailableFromController` Switch Configuration records are tracked separately from true download failures.
+- Retention runs when only unavailable Switch Configuration records remain, but skips when actual final download failures remain.

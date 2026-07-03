@@ -25,13 +25,23 @@
 
     Use -DebugCapture to also save raw request/response metadata and bodies.
 
-    Version: 1.28
-    Changes in v1.28:
-      - Standardized script filename remains Get-RuckusSmartZoneBackup.ps1
-      - Added robust status Boolean handling for Windows PowerShell 5.1
-      - Writes per-run run-status.json and root-level last-run-status.json
-      - Uses exit codes: 0 Success, 1 Failure, 2 PartialFailure
-      - Adds best-effort Windows Event Log entries
+    Version: 1.30.5
+    Changes in v1.30.5:
+      - Public repo refresh: removes environment-specific default backup root from first-run prompts/help
+      - Preserves v1.30.4 retry, unavailable switch record, and retention behavior
+
+    Changes in v1.30.1:
+      - Fixes PowerShell 5.1 parser issue in retry round log message when a variable was followed by a colon
+    1.30.2
+      - Fixes retry array handling so retry tasks are not wrapped as nested arrays in Windows PowerShell 5.1
+      - Updates runtime banner/version logging to match script version
+
+    Changes in v1.30:
+      - Adds retry handling for failed, empty, timed-out, and size-mismatched downloads
+      - Adds retry attempt metadata to download-status.json
+      - Adds clearer failure reasons when Invoke-WebRequest returns no useful error
+      - Adds optional RequestTimeoutSeconds, RetryCount, and RetryDelaySeconds parameters
+      - Keeps final status based on the last attempt per backup item
 
 .NOTES
     Windows PowerShell 5.1 compatible, because apparently we still live here.
@@ -65,6 +75,18 @@ param(
 
     [Parameter(Mandatory = $false)]
     [int]$MaxDownloadPerCategory = 999,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 10)]
+    [int]$RetryCount = 2,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 3600)]
+    [int]$RetryDelaySeconds = 10,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 86400)]
+    [int]$RequestTimeoutSeconds = 0,
 
     [Parameter(Mandatory = $false)]
     [switch]$NoDownload,
@@ -106,8 +128,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$script:ScriptVersion = "1.29"
+$script:ScriptVersion = "1.30.5"
 $script:FinalExitCode = 1
+$script:RequestTimeoutSeconds = 0
 
 
 function Show-RuckusBackupHelp {
@@ -125,8 +148,9 @@ function Show-RuckusBackupHelp {
     Write-Host "  HTTPS port defaults to 8443 and is not prompted or stored."
     Write-Host "  SkipCertificateCheck defaults to enabled."
     Write-Host ""
-    Write-Host "Default backup destination:"
-    Write-Host "  <OutputRoot>\<yyyyMMdd-HHmmss>\"
+    Write-Host "Backup destination:"
+    Write-Host "  No built-in default path is used. First run prompts for OutputRoot if it is not supplied or saved."
+    Write-Host "  Example: D:\SmartZoneBackups\<yyyyMMdd-HHmmss>\"
     Write-Host ""
     Write-Host "Common usage:"
     Write-Host "  .\Get-RuckusSmartZoneBackup.ps1"
@@ -141,7 +165,7 @@ function Show-RuckusBackupHelp {
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  -BaseHost                 SmartZone/vSZ host or FQDN. Prompted/saved on first run if omitted."
-    Write-Host "  -OutputRoot               Root backup folder. Required on first run if omitted, then saved for future runs."
+    Write-Host "  -OutputRoot               Root backup folder. Prompted/saved on first run if omitted."
     Write-Host "  -Port                     HTTPS port for this run only. Default: 8443. Not prompted or stored."
     Write-Host "  -UpdateCreds              Replace the saved username/password."
     Write-Host "  -ResetSavedConfig         Remove saved BaseHost/OutputRoot/SkipCertificateCheck and prompt again."
@@ -299,9 +323,12 @@ function Write-BackupRunStatus {
         [int]$RawAttempts,
         [int]$RawSuccess,
         [int]$RawFailed,
+        [int]$RawUnavailable,
         [int]$FinalFiles,
         [int]$FinalSuccess,
+        [int]$FinalUnavailable,
         [int]$FinalFailed,
+        [object[]]$UnavailableItems,
         [object[]]$FailedItems,
         [string]$Message
     )
@@ -341,9 +368,12 @@ function Write-BackupRunStatus {
         RawAttempts             = $RawAttempts
         RawSuccess              = $RawSuccess
         RawFailed               = $RawFailed
+        RawUnavailable          = $RawUnavailable
         FinalFiles              = $FinalFiles
         FinalSuccess            = $FinalSuccess
+        FinalUnavailable        = $FinalUnavailable
         FinalFailed             = $FinalFailed
+        UnavailableItems        = @($UnavailableItems)
         FailedItems             = @($FailedItems)
         Message                 = $Message
     }
@@ -438,10 +468,7 @@ function Resolve-Settings {
 
     if ([string]::IsNullOrWhiteSpace($resolvedOutputRoot)) {
         do {
-            $rootInput = Read-Host "Enter backup destination root"
-            if ([string]::IsNullOrWhiteSpace($rootInput)) {
-                Write-Warning "Backup destination root is required. Example: D:\SmartZoneBackups"
-            }
+            $rootInput = Read-Host "Enter backup destination root (required; example: D:\SmartZoneBackups)"
         } while ([string]::IsNullOrWhiteSpace($rootInput))
         $resolvedOutputRoot = $rootInput
     }
@@ -679,6 +706,7 @@ function Invoke-RuckusRequest {
     if ($null -ne $Body) { $params.Body = $Body }
     if ($ContentType) { $params.ContentType = $ContentType }
     if ($OutFile) { $params.OutFile = $OutFile }
+    if ($script:RequestTimeoutSeconds -gt 0) { $params.TimeoutSec = [int]$script:RequestTimeoutSeconds }
     if ($script:EffectiveSkipCertificateCheck -and ($PSVersionTable.PSVersion.Major -ge 6)) { $params.SkipCertificateCheck = $true }
 
     if ($CaptureDebug) {
@@ -919,7 +947,9 @@ function Invoke-BackupDownload {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
         [string]$OutputPath,
         [System.Collections.Generic.List[object]]$StatusList,
-        [bool]$CaptureDebug
+        [bool]$CaptureDebug,
+        [int]$AttemptNumber = 1,
+        [string]$AttemptType = "Initial"
     )
 
     $dir = Split-Path $OutFile -Parent
@@ -930,11 +960,12 @@ function Invoke-BackupDownload {
     }
 
     $expectedText = if ($null -ne $ExpectedSize) { " expected $ExpectedSize bytes" } else { "" }
-    Add-RunLog "Downloading [$Category] $DisplayName$expectedText..."
+    $attemptText = if ($AttemptNumber -gt 1) { " retry attempt $($AttemptNumber - 1)" } else { "" }
+    Add-RunLog "Downloading [$Category] $DisplayName$expectedText$attemptText..."
 
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $headers = New-RuckusAjaxHeaders -Accept "*/*"
-    $result = Invoke-RuckusRequest -Name ("download-$Category-$Id" -replace '[^a-zA-Z0-9\._-]', '_') -Method GET -Uri $Uri -Session $Session -Headers $headers -OutFile $OutFile -OutputPath $OutputPath -CaptureDebug:$CaptureDebug
+    $result = Invoke-RuckusRequest -Name ("download-$Category-$Id-attempt-$AttemptNumber" -replace '[^a-zA-Z0-9\._-]', '_') -Method GET -Uri $Uri -Session $Session -Headers $headers -OutFile $OutFile -OutputPath $OutputPath -CaptureDebug:$CaptureDebug
     $timer.Stop()
 
     $exists = Test-Path $OutFile
@@ -947,13 +978,45 @@ function Invoke-BackupDownload {
     if ($null -ne $ExpectedSize) { $sizeMatches = ($bytes -eq [int64]$ExpectedSize) }
 
     # Invoke-WebRequest -OutFile on Windows PowerShell 5.1 may not return StatusCode in a normal object.
-    # Treat no exception + non-zero file as success. Apparently the file itself is the adult in the room.
+    # Treat no exception + non-zero file as success, then separately validate size when SmartZone provided one.
     $ok = ($result.Success -and $exists -and $bytes -gt 0)
+    $failureReason = $null
+    $outcome = "Success"
+
+    if (-not $result.Success) {
+        $failureReason = $result.ErrorMessage
+        $outcome = "RequestFailure"
+    }
+    elseif (-not $exists) {
+        $failureReason = "Invoke-WebRequest completed without throwing, but no output file was created."
+        $outcome = "MissingOutputFile"
+    }
+    elseif ($bytes -le 0) {
+        $failureReason = "Invoke-WebRequest completed without throwing, but the output file was empty."
+        $outcome = "EmptyResponse"
+    }
+
     if ($ok -and ($false -eq $sizeMatches)) {
         $ok = $false
-        if ([string]::IsNullOrWhiteSpace([string]$result.ErrorMessage)) {
-            $result.ErrorMessage = "Downloaded file size ($bytes bytes) does not match expected size ($ExpectedSize bytes)."
+        $failureReason = "Downloaded file size ($bytes bytes) does not match expected size ($ExpectedSize bytes)."
+        $outcome = "SizeMismatch"
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$failureReason)) {
+        if (-not $ok) {
+            $failureReason = "Download did not complete successfully; no detailed error was returned by Invoke-WebRequest."
+            if ([string]::IsNullOrWhiteSpace([string]$outcome) -or $outcome -eq "Success") { $outcome = "UnknownFailure" }
         }
+        else { $failureReason = $null }
+    }
+
+    if (-not $ok -and [string]::IsNullOrWhiteSpace([string]$result.ErrorMessage)) {
+        $result.ErrorMessage = $failureReason
+    }
+
+    $retryable = $false
+    if (-not $ok) {
+        $retryable = $true
     }
 
     if ($ok) {
@@ -962,7 +1025,7 @@ function Invoke-BackupDownload {
         Add-RunLog $msg
     }
     else {
-        Add-ErrorLog "Download failed or produced an empty file for [$Category] $DisplayName. Error: $($result.ErrorMessage)"
+        Add-ErrorLog "Download failed for [$Category] $DisplayName. Attempt=$AttemptNumber Retryable=$retryable Error: $failureReason"
     }
 
     [void]$StatusList.Add([pscustomobject]@{
@@ -978,7 +1041,11 @@ function Invoke-BackupDownload {
         SizeMatches     = $sizeMatches
         HttpStatus      = $result.StatusCode
         DurationSeconds = [math]::Round($timer.Elapsed.TotalSeconds, 2)
-        ErrorMessage    = $result.ErrorMessage
+        AttemptNumber   = $AttemptNumber
+        AttemptType     = $AttemptType
+        Retryable       = $retryable
+        Outcome         = $outcome
+        ErrorMessage    = $failureReason
     })
 }
 
@@ -1021,8 +1088,59 @@ function New-DownloadTask {
 }
 
 function Invoke-DownloadTaskSequential {
-    param($Task,[Microsoft.PowerShell.Commands.WebRequestSession]$Session,[string]$OutputPath,[System.Collections.Generic.List[object]]$StatusList,[bool]$CaptureDebug)
-    Invoke-BackupDownload -Category $Task.Category -Id $Task.Id -DisplayName $Task.DisplayName -Uri $Task.Uri -OutFile $Task.OutFile -ExpectedSize $Task.ExpectedSize -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug
+    param(
+        $Task,
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [string]$OutputPath,
+        [System.Collections.Generic.List[object]]$StatusList,
+        [bool]$CaptureDebug,
+        [int]$AttemptNumber = 1,
+        [string]$AttemptType = "Initial"
+    )
+    Invoke-BackupDownload -Category $Task.Category -Id $Task.Id -DisplayName $Task.DisplayName -Uri $Task.Uri -OutFile $Task.OutFile -ExpectedSize $Task.ExpectedSize -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug -AttemptNumber $AttemptNumber -AttemptType $AttemptType
+}
+
+function Get-DownloadTaskKey {
+    param($Task)
+    return ('{0}|{1}' -f ([string]$Task.Category), ([string]$Task.Id))
+}
+
+function Get-PendingDownloadTasks {
+    param(
+        [object[]]$Tasks,
+        [System.Collections.Generic.List[object]]$StatusList
+    )
+
+    $lastByTask = @{}
+    foreach ($entry in $StatusList) {
+        if ($null -eq $entry) { continue }
+        $cat = ""
+        $id = ""
+        try { $cat = [string]$entry.Category } catch {}
+        try { $id = [string]$entry.Id } catch {}
+        if ([string]::IsNullOrWhiteSpace($cat) -or [string]::IsNullOrWhiteSpace($id)) { continue }
+        $lastByTask[('{0}|{1}' -f $cat, $id)] = $entry
+    }
+
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($task in $Tasks) {
+        $key = Get-DownloadTaskKey -Task $task
+        if (-not $lastByTask.ContainsKey($key)) {
+            [void]$pending.Add($task)
+            continue
+        }
+        $entry = $lastByTask[$key]
+        $success = $false
+        try {
+            $successProperty = $entry.PSObject.Properties["Success"]
+            if ($null -ne $successProperty -and $successProperty.Value -eq $true) { $success = $true }
+        } catch {}
+        if (-not $success) { [void]$pending.Add($task) }
+    }
+
+    $arr = New-Object 'object[]' $pending.Count
+    for ($i = 0; $i -lt $pending.Count; $i++) { $arr[$i] = $pending[$i] }
+    return $arr
 }
 
 
@@ -1048,7 +1166,7 @@ function ConvertTo-PlainObjectArray {
     for ($i = 0; $i -lt $list.Count; $i++) {
         $arr[$i] = $list[$i]
     }
-    return ,$arr
+    return $arr
 }
 
 function Invoke-DownloadTaskBatch {
@@ -1058,7 +1176,9 @@ function Invoke-DownloadTaskBatch {
         [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
         [string]$OutputPath,
         [System.Collections.Generic.List[object]]$StatusList,
-        [bool]$CaptureDebug
+        [bool]$CaptureDebug,
+        [int]$RetryCount = 2,
+        [int]$RetryDelaySeconds = 10
     )
 
     $Tasks = ConvertTo-PlainObjectArray -InputObject $Tasks
@@ -1067,12 +1187,36 @@ function Invoke-DownloadTaskBatch {
         return
     }
 
-    Add-RunLog "Starting [$Category] download batch: $($Tasks.Count) file(s). Sequential=True"
+    Add-RunLog "Starting [$Category] download batch: $($Tasks.Count) file(s). Sequential=True RetryCount=$RetryCount"
 
     foreach ($task in $Tasks) {
-        Invoke-DownloadTaskSequential -Task $task -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug
+        Invoke-DownloadTaskSequential -Task $task -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug -AttemptNumber 1 -AttemptType "Initial"
+    }
+
+    for ($retryRound = 1; $retryRound -le $RetryCount; $retryRound++) {
+        $pending = @(Get-PendingDownloadTasks -Tasks $Tasks -StatusList $StatusList)
+        if ($pending.Count -lt 1) {
+            if ($retryRound -eq 1) { Add-RunLog "No [$Category] retry downloads needed." }
+            break
+        }
+
+        Add-RunLog "Starting [$Category] retry round $retryRound of ${RetryCount}: $($pending.Count) file(s)."
+        if ($RetryDelaySeconds -gt 0) { Start-Sleep -Seconds $RetryDelaySeconds }
+
+        foreach ($task in $pending) {
+            Invoke-DownloadTaskSequential -Task $task -Session $Session -OutputPath $OutputPath -StatusList $StatusList -CaptureDebug:$CaptureDebug -AttemptNumber ($retryRound + 1) -AttemptType "Retry"
+        }
+    }
+
+    $remaining = @(Get-PendingDownloadTasks -Tasks $Tasks -StatusList $StatusList)
+    if ($remaining.Count -gt 0) {
+        Add-ErrorLog "[$Category] downloads still failing after retry handling: $($remaining.Count) file(s)."
+    }
+    else {
+        Add-RunLog "[$Category] downloads completed successfully after retry handling."
     }
 }
+
 
 function New-SwitchConfigQueryBody {
     param([int]$Limit = 30000)
@@ -1141,9 +1285,10 @@ if ($PruneOnly) {
     if (-not (Test-Path $pruneLogRoot)) { New-Item -ItemType Directory -Path $pruneLogRoot -Force | Out-Null }
     $script:RunLogPath = Join-Path $pruneLogRoot "retention-prune.log"
     $script:ErrorLogPath = Join-Path $pruneLogRoot "retention-prune-errors.log"
-    Add-RunLog "RUCKUS Backup API Downloader v1.28 - PruneOnly"
+    Add-RunLog "RUCKUS Backup API Downloader v1.30.4 - PruneOnly"
     Add-RunLog "Output root: $($settings.OutputRoot)"
     Add-RunLog "Retention: keep newest $KeepBackupRuns backup run folder(s)"
+    Add-RunLog "Download retry handling: RetryCount=$RetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
     Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
     Add-RunLog "PruneOnly complete."
     return
@@ -1163,7 +1308,7 @@ $switchItems = @()
 $downloadStatusArray = @()
 
 try {
-    Add-RunLog "RUCKUS Backup API Downloader v1.28"
+    Add-RunLog "RUCKUS Backup API Downloader v1.30.4"
     Add-RunLog "Target: $script:BaseUri"
     Add-RunLog "Output: $outPath"
     Add-RunLog "Output root: $($settings.OutputRoot)"
@@ -1320,7 +1465,7 @@ try {
             [void]$configTasks.Add((New-DownloadTask -Category "system-config" -Id $id -DisplayName $name -Uri $downloadUri -OutFile $outFile -ExpectedSize $size))
             $count++
         }
-        Invoke-DownloadTaskBatch -Category "system-config" -Tasks $configTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture
+        Invoke-DownloadTaskBatch -Category "system-config" -Tasks $configTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 
         $switchTasks = New-Object System.Collections.Generic.List[object]
         if ($switchConfigBaseUri) {
@@ -1336,7 +1481,7 @@ try {
                 $count++
             }
         }
-        Invoke-DownloadTaskBatch -Category "switch-config" -Tasks $switchTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture
+        Invoke-DownloadTaskBatch -Category "switch-config" -Tasks $switchTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 
         $clusterTasks = New-Object System.Collections.Generic.List[object]
         $count = 0
@@ -1360,7 +1505,7 @@ try {
             }
             $count++
         }
-        Invoke-DownloadTaskBatch -Category "cluster" -Tasks $clusterTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture
+        Invoke-DownloadTaskBatch -Category "cluster" -Tasks $clusterTasks -Session $session -OutputPath $outPath -StatusList $downloadStatus -CaptureDebug:$DebugCapture -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
     }
     else {
         Add-RunLog "NoDownload selected. Listing completed without downloading files."
@@ -1376,6 +1521,7 @@ try {
     $attempts = 0
     $rawOkCount = 0
     $rawFailCount = 0
+    $rawUnavailableCount = 0
     $finalByTask = @{}
 
     foreach ($entry in $downloadStatusArray) {
@@ -1386,7 +1532,15 @@ try {
         $successProperty = $entry.PSObject.Properties["Success"]
         if ($null -ne $successProperty -and $successProperty.Value -eq $true) { $entrySuccess = $true }
 
-        if ($entrySuccess) { $rawOkCount++ } else { $rawFailCount++ }
+        $entryOutcome = ""
+        try {
+            $outcomeProperty = $entry.PSObject.Properties["Outcome"]
+            if ($null -ne $outcomeProperty) { $entryOutcome = [string]$outcomeProperty.Value }
+        } catch {}
+
+        if ($entrySuccess) { $rawOkCount++ }
+        elseif ($entry.Category -eq "switch-config" -and ($entryOutcome -eq "EmptyResponse" -or $entryOutcome -eq "MissingOutputFile")) { $rawUnavailableCount++ }
+        else { $rawFailCount++ }
 
         $cat = ""
         $id = ""
@@ -1399,8 +1553,10 @@ try {
 
     $finalTotal = 0
     $finalOkCount = 0
+    $finalUnavailableCount = 0
     $finalFailCount = 0
     $failedItems = @()
+    $unavailableItems = @()
     $systemDownloaded = 0
     $switchDownloaded = 0
     $clusterDownloaded = 0
@@ -1422,28 +1578,62 @@ try {
             } catch {}
         }
         else {
-            $finalFailCount++
             $failedCategory = "unknown"
             $failedId = ""
             $failedDisplayName = ""
             $failedOutFile = ""
             $failedError = ""
+            $failedOutcome = ""
             try { $failedCategory = [string]$entry.Category } catch {}
             try { $failedId = [string]$entry.Id } catch {}
             try { $failedDisplayName = [string]$entry.DisplayName } catch {}
             try { $failedOutFile = [string]$entry.OutFile } catch {}
-            try { $failedError = [string]$entry.Error } catch {}
-            $failedItems += [pscustomobject]@{
-                Category    = $failedCategory
-                Id          = $failedId
-                DisplayName = $failedDisplayName
-                OutFile     = $failedOutFile
-                Error       = $failedError
+            try { $failedError = [string]$entry.ErrorMessage } catch {}
+            try {
+                $outcomeProperty = $entry.PSObject.Properties["Outcome"]
+                if ($null -ne $outcomeProperty) { $failedOutcome = [string]$outcomeProperty.Value }
+            } catch {}
+
+            if ($failedCategory -eq "switch-config" -and ($failedOutcome -eq "EmptyResponse" -or $failedOutcome -eq "MissingOutputFile")) {
+                $finalUnavailableCount++
+                $unavailableItems += [pscustomobject]@{
+                    Category    = $failedCategory
+                    Id          = $failedId
+                    DisplayName = $failedDisplayName
+                    OutFile     = $failedOutFile
+                    Outcome     = "UnavailableFromController"
+                    Error       = $failedError
+                }
+            }
+            else {
+                $finalFailCount++
+                $failedItems += [pscustomobject]@{
+                    Category    = $failedCategory
+                    Id          = $failedId
+                    DisplayName = $failedDisplayName
+                    OutFile     = $failedOutFile
+                    Outcome     = $failedOutcome
+                    Error       = $failedError
+                }
             }
         }
     }
 
-    Add-RunLog "Download summary: RawAttempts=$attempts RawSuccess=$rawOkCount RawFailed=$rawFailCount FinalFiles=$finalTotal FinalSuccess=$finalOkCount FinalFailed=$finalFailCount"
+    $recoveredByRetry = 0
+    foreach ($key in $finalByTask.Keys) {
+        $entry = $finalByTask[$key]
+        $success = $false
+        $attemptNumber = 1
+        try {
+            $successProperty = $entry.PSObject.Properties["Success"]
+            if ($null -ne $successProperty -and $successProperty.Value -eq $true) { $success = $true }
+            $attemptProperty = $entry.PSObject.Properties["AttemptNumber"]
+            if ($null -ne $attemptProperty) { $attemptNumber = [int]$attemptProperty.Value }
+        } catch {}
+        if ($success -and $attemptNumber -gt 1) { $recoveredByRetry++ }
+    }
+
+    Add-RunLog "Download summary: RawAttempts=$attempts RawSuccess=$rawOkCount RawFailed=$rawFailCount RawUnavailable=$rawUnavailableCount RecoveredByRetry=$recoveredByRetry FinalFiles=$finalTotal FinalSuccess=$finalOkCount FinalUnavailable=$finalUnavailableCount FinalFailed=$finalFailCount"
     Add-RunLog "Details: $outPath\logs\download-status.json"
 
     $runStatus = "Failure"
@@ -1468,6 +1658,13 @@ try {
         $statusMessage = "SmartZone backup partially failed. One or more files failed to download."
         Add-RunLog "One or more final file downloads failed after recovery attempts. Retention cleanup skipped to preserve older backup runs."
     }
+    elseif ($finalUnavailableCount -gt 0) {
+        $runStatus = "PartialFailure"
+        $exitCode = 2
+        $statusMessage = "SmartZone backup partially completed. One or more switch configuration records returned empty content after retries and were classified as unavailable from the controller."
+        Add-RunLog "One or more switch configuration records returned empty content after retries and were classified as unavailable from the controller. Retention cleanup will still run because downloaded backup files completed successfully."
+        Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
+    }
     else {
         $runStatus = "Success"
         $exitCode = 0
@@ -1475,7 +1672,7 @@ try {
         Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
     }
 
-    Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status $runStatus -ExitCode $exitCode -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded $systemDownloaded -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded $switchDownloaded -ClusterFound $clusterItems.Count -ClusterDownloaded $clusterDownloaded -RawAttempts $attempts -RawSuccess $rawOkCount -RawFailed $rawFailCount -FinalFiles $finalTotal -FinalSuccess $finalOkCount -FinalFailed $finalFailCount -FailedItems $failedItems -Message $statusMessage
+    Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status $runStatus -ExitCode $exitCode -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded $systemDownloaded -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded $switchDownloaded -ClusterFound $clusterItems.Count -ClusterDownloaded $clusterDownloaded -RawAttempts $attempts -RawSuccess $rawOkCount -RawFailed $rawFailCount -RawUnavailable $rawUnavailableCount -FinalFiles $finalTotal -FinalSuccess $finalOkCount -FinalUnavailable $finalUnavailableCount -FinalFailed $finalFailCount -UnavailableItems $unavailableItems -FailedItems $failedItems -Message $statusMessage
     $script:FinalExitCode = $exitCode
 
     Add-RunLog "Complete. Output folder: $outPath"
@@ -1484,7 +1681,7 @@ catch {
     $msg = "Fatal error: $($_.Exception.Message)"
     Add-ErrorLog $msg
     try {
-        Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status "Failure" -ExitCode 1 -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded 0 -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded 0 -ClusterFound $clusterItems.Count -ClusterDownloaded 0 -RawAttempts 0 -RawSuccess 0 -RawFailed 0 -FinalFiles 0 -FinalSuccess 0 -FinalFailed 1 -FailedItems @([pscustomobject]@{ Category="fatal"; Id=""; DisplayName="Fatal script error"; OutFile=""; Error=$_.Exception.Message }) -Message $msg
+        Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status "Failure" -ExitCode 1 -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded 0 -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded 0 -ClusterFound $clusterItems.Count -ClusterDownloaded 0 -RawAttempts 0 -RawSuccess 0 -RawFailed 0 -RawUnavailable 0 -FinalFiles 0 -FinalSuccess 0 -FinalUnavailable 0 -FinalFailed 1 -UnavailableItems @() -FailedItems @([pscustomobject]@{ Category="fatal"; Id=""; DisplayName="Fatal script error"; OutFile=""; Outcome="Fatal"; Error=$_.Exception.Message }) -Message $msg
     }
     catch {
         Add-ErrorLog "Unable to write failure run status: $($_.Exception.Message)"
