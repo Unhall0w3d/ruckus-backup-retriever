@@ -138,6 +138,16 @@ Run cluster endpoint diagnostics without downloading multi-GB cluster files:
 .\Get-RuckusSmartZoneBackup.ps1 -ClusterDiagnosticsOnly -SkipSwitchBackups -MaxDownloadPerCategory 1
 ```
 
+## Testing
+
+Run the local contract tests from the repository root:
+
+```powershell
+.\tests\Run-Tests.ps1
+```
+
+The test runner dot-sources the main script without starting a live backup run, then checks the parsing, selection, retry, and credential-ticket helpers against local fixtures.
+
 ## Important parameters
 
 | Parameter | Default | Purpose |
@@ -165,9 +175,11 @@ Run cluster endpoint diagnostics without downloading multi-GB cluster files:
 Each run creates a timestamped folder under the selected backup root:
 
 ```text
-<BackupRoot>60703-191501├── downloaded backup files
+<BackupRoot>\<timestamp>\
+├── downloaded backup files
 ├── run-status.json
-└── logs    ├── run.log
+└── logs\
+    ├── run.log
     ├── config-list.json
     ├── cluster-list.json
     ├── switch-list.json
@@ -175,6 +187,8 @@ Each run creates a timestamped folder under the selected backup root:
     ├── download-status.json
     └── errors.log
 ```
+
+If you use `-NoDownload`, the run folder also includes `download-plan.json`.
 
 The backup root also contains:
 

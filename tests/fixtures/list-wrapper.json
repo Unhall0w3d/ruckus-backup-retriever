@@ -1,0 +1,16 @@
+{
+  "data": {
+    "list": [
+      {
+        "key": "cfg-1",
+        "filename": "system-1.bak",
+        "filesize": 128
+      },
+      {
+        "key": "cfg-2",
+        "filename": "system-2.bak",
+        "filesize": 256
+      }
+    ]
+  }
+}

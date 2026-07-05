@@ -222,7 +222,7 @@ function Show-RuckusBackupHelp {
     Write-Host "  -UpdateCreds              Replace the saved username/password."
     Write-Host "  -ResetSavedConfig         Remove saved BaseHost/OutputRoot/SkipCertificateCheck and prompt again."
     Write-Host "  -ResetSavedCredential     Remove the saved credential and prompt again."
-    Write-Host "  -NoDownload               List backups only; do not download."
+    Write-Host "  -NoDownload               List backups only; write logs\download-plan.json; do not download."
     Write-Host "  -SkipClusterBackups       Skip Cluster backup listing/download. Useful for testing without huge files."
     Write-Host "  -SkipSwitchBackups        Skip Switch config listing/download."
     Write-Host "  -MaxDownloadPerCategory   Limit downloads per category after category-specific filtering. Default: 999."
@@ -1112,6 +1112,50 @@ function Get-BackupSize {
     try { return [int64]$v } catch { return $null }
 }
 
+function Test-RetryableDownloadFailure {
+    param(
+        [string]$Category,
+        [string]$Outcome,
+        [object]$StatusCode,
+        [string]$ErrorMessage
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Outcome)) { $Outcome = "UnknownFailure" }
+
+    if ($Outcome -in @("EmptyResponse", "MissingOutputFile", "SizeMismatch")) {
+        return $true
+    }
+
+    $code = $null
+    try {
+        if ($null -ne $StatusCode -and -not [string]::IsNullOrWhiteSpace([string]$StatusCode)) {
+            $code = [int]$StatusCode
+        }
+    }
+    catch {}
+
+    if ($null -ne $code) {
+        if ($code -in @(400,401,403,404,405,410,412,415,422)) {
+            return $false
+        }
+        if ($code -ge 500) {
+            return $true
+        }
+        if ($code -eq 408 -or $code -eq 429) {
+            return $true
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
+        if ($ErrorMessage -match '(?i)timed? out|timeout|temporarily unavailable|connection (was )?closed|connection reset|unable to connect|503|502|gateway') {
+            return $true
+        }
+    }
+
+    # Default to retrying ambiguous failures unless they were clearly permanent.
+    return ($Category -eq "cluster" -or $Outcome -eq "RequestFailure" -or $Outcome -eq "UnknownFailure")
+}
+
 function Get-ClusterBladeUuids {
     param($Item)
     $list = New-Object System.Collections.Generic.List[string]
@@ -1214,7 +1258,7 @@ function Invoke-BackupDownload {
 
     $retryable = $false
     if (-not $ok) {
-        $retryable = $true
+        $retryable = Test-RetryableDownloadFailure -Category $Category -Outcome $outcome -StatusCode $result.StatusCode -ErrorMessage $failureReason
     }
 
     if ($ok) {
@@ -1569,7 +1613,14 @@ function Get-PendingDownloadTasks {
             $successProperty = $entry.PSObject.Properties["Success"]
             if ($null -ne $successProperty -and $successProperty.Value -eq $true) { $success = $true }
         } catch {}
-        if (-not $success) { [void]$pending.Add($task) }
+        if (-not $success) {
+            $retryable = $true
+            try {
+                $retryableProperty = $entry.PSObject.Properties["Retryable"]
+                if ($null -ne $retryableProperty) { $retryable = [bool]$retryableProperty.Value }
+            } catch {}
+            if ($retryable) { [void]$pending.Add($task) }
+        }
     }
 
     $arr = New-Object 'object[]' $pending.Count
@@ -1851,45 +1902,49 @@ function Get-SwitchConfigName {
     return $safe
 }
 
-# Main
-$effectiveResetCred = ($ResetSavedCredential -or $UpdateCreds)
-$settings = Resolve-Settings -InputBaseHost $BaseHost -InputOutputRoot $OutputRoot -InputPort $Port -InputSkipCertificateCheck:$SkipCertificateCheck -InputNoSkipCertificateCheck:$NoSkipCertificateCheck -InputConfigPath $ConfigPath -InputResetSavedConfig:$ResetSavedConfig
-$script:EffectiveSkipCertificateCheck = [bool]$settings.SkipCertificateCheck
-$script:RequestTimeoutSeconds = [int]$RequestTimeoutSeconds
-Enable-CertBypassIfNeeded -Enable $script:EffectiveSkipCertificateCheck
+function Invoke-RuckusSmartZoneBackup {
+    # Main
+    $effectiveResetCred = ($ResetSavedCredential -or $UpdateCreds)
+    $settings = $null
+    $runLock = $null
+    $outPath = $null
+    $configItems = @()
+    $clusterItems = @()
+    $switchItems = @()
+    $downloadStatusArray = @()
 
-$script:BaseUri = "https://$($settings.BaseHost):$($settings.Port)"
-$runLock = $null
+    try {
+    $settings = Resolve-Settings -InputBaseHost $BaseHost -InputOutputRoot $OutputRoot -InputPort $Port -InputSkipCertificateCheck:$SkipCertificateCheck -InputNoSkipCertificateCheck:$NoSkipCertificateCheck -InputConfigPath $ConfigPath -InputResetSavedConfig:$ResetSavedConfig
+    $script:EffectiveSkipCertificateCheck = [bool]$settings.SkipCertificateCheck
+    $script:RequestTimeoutSeconds = [int]$RequestTimeoutSeconds
+    Enable-CertBypassIfNeeded -Enable $script:EffectiveSkipCertificateCheck
 
-if ($PruneOnly) {
-    $pruneLogRoot = $settings.OutputRoot
-    if (-not (Test-Path $pruneLogRoot)) { New-Item -ItemType Directory -Path $pruneLogRoot -Force | Out-Null }
-    $script:RunLogPath = Join-Path $pruneLogRoot "retention-prune.log"
-    $script:ErrorLogPath = Join-Path $pruneLogRoot "retention-prune-errors.log"
-    Add-RunLog "RUCKUS Backup API Downloader v$script:ScriptVersion - PruneOnly"
-    Add-RunLog "Output root: $($settings.OutputRoot)"
-    Add-RunLog "Retention: keep newest $KeepBackupRuns backup run folder(s)"
-    Add-RunLog "Download retry handling: RetryCount=$RetryCount ClusterRetryCount=$ClusterRetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
-    Add-RunLog "Cluster diagnostics: ClusterDiagnosticsOnly=$([bool]$ClusterDiagnosticsOnly) NoClusterHeaderProbe=$([bool]$NoClusterHeaderProbe) ClusterProbeTimeoutSeconds=$ClusterProbeTimeoutSeconds"
-    Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
-    Add-RunLog "PruneOnly complete."
-    return
-}
+    $script:BaseUri = "https://$($settings.BaseHost):$($settings.Port)"
 
-$outPath = New-TimestampedOutputFolder -Root $settings.OutputRoot
-$runStarted = Get-Date
-$script:FinalExitCode = 1
-$runLock = New-RunLock -Root $settings.OutputRoot
-if ($DebugCapture) { New-Item -ItemType Directory -Path (Join-Path $outPath "debug") -Force | Out-Null }
+    if ($PruneOnly) {
+        $pruneLogRoot = $settings.OutputRoot
+        if (-not (Test-Path $pruneLogRoot)) { New-Item -ItemType Directory -Path $pruneLogRoot -Force | Out-Null }
+        $script:RunLogPath = Join-Path $pruneLogRoot "retention-prune.log"
+        $script:ErrorLogPath = Join-Path $pruneLogRoot "retention-prune-errors.log"
+        Add-RunLog "RUCKUS Backup API Downloader v$script:ScriptVersion - PruneOnly"
+        Add-RunLog "Output root: $($settings.OutputRoot)"
+        Add-RunLog "Retention: keep newest $KeepBackupRuns backup run folder(s)"
+        Add-RunLog "Download retry handling: RetryCount=$RetryCount ClusterRetryCount=$ClusterRetryCount RetryDelaySeconds=$RetryDelaySeconds RequestTimeoutSeconds=$RequestTimeoutSeconds"
+        Add-RunLog "Cluster diagnostics: ClusterDiagnosticsOnly=$([bool]$ClusterDiagnosticsOnly) NoClusterHeaderProbe=$([bool]$NoClusterHeaderProbe) ClusterProbeTimeoutSeconds=$ClusterProbeTimeoutSeconds"
+        Invoke-BackupRunRetention -Root $settings.OutputRoot -Keep $KeepBackupRuns
+        Add-RunLog "PruneOnly complete."
+        return 0
+    }
 
-$script:RunLogPath = Join-Path $outPath "logs\run.log"
-$script:ErrorLogPath = Join-Path $outPath "logs\errors.log"
-$configItems = @()
-$clusterItems = @()
-$switchItems = @()
-$downloadStatusArray = @()
+    $runLock = New-RunLock -Root $settings.OutputRoot
+    $outPath = New-TimestampedOutputFolder -Root $settings.OutputRoot
+    $runStarted = Get-Date
+    $script:FinalExitCode = 1
+    if ($DebugCapture) { New-Item -ItemType Directory -Path (Join-Path $outPath "debug") -Force | Out-Null }
 
-try {
+    $script:RunLogPath = Join-Path $outPath "logs\run.log"
+    $script:ErrorLogPath = Join-Path $outPath "logs\errors.log"
+
     Add-RunLog "RUCKUS Backup API Downloader v$script:ScriptVersion"
     Add-RunLog "Target: $script:BaseUri"
     Add-RunLog "Output: $outPath"
@@ -2131,7 +2186,32 @@ try {
         }
     }
     else {
+        $downloadPlan = [ordered]@{
+            ScriptName            = "Get-RuckusSmartZoneBackup.ps1"
+            ScriptVersion         = $script:ScriptVersion
+            Timestamp             = (Get-Date).ToString("o")
+            BaseHost              = $settings.BaseHost
+            Port                  = $settings.Port
+            OutputFolder          = $outPath
+            NoDownload            = $true
+            SkipClusterBackups    = [bool]$SkipClusterBackups
+            SkipSwitchBackups     = [bool]$SkipSwitchBackups
+            MaxDownloadPerCategory = $MaxDownloadPerCategory
+            SwitchConfigsPerDevice = $SwitchConfigsPerDevice
+            ClusterBackupsPerBlade = $ClusterBackupsPerBlade
+            DiscoveredCounts      = [ordered]@{
+                SystemConfig = $configItems.Count
+                SwitchConfig  = $switchItems.Count
+                Cluster       = $clusterItems.Count
+            }
+            Notes = @(
+                "NoDownload was selected, so no download requests were issued."
+                "Use the discovery counts and the endpoint-specific JSON logs to review what was found."
+            )
+        }
+        Write-SafeJson -Path (Join-Path $outPath "logs\download-plan.json") -Object $downloadPlan
         Add-RunLog "NoDownload selected. Listing completed without downloading files."
+        Add-RunLog "Planned download summary written: $outPath\logs\download-plan.json"
     }
 
     $downloadStatusArray = @()
@@ -2320,20 +2400,27 @@ try {
     $script:FinalExitCode = $exitCode
 
     Add-RunLog "Complete. Output folder: $outPath"
-}
-catch {
-    $msg = "Fatal error: $($_.Exception.Message)"
-    Add-ErrorLog $msg
-    try {
-        Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status "Failure" -ExitCode 1 -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded 0 -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded 0 -ClusterFound $clusterItems.Count -ClusterDownloaded 0 -RawAttempts 0 -RawSuccess 0 -RawFailed 0 -RawUnavailable 0 -FinalFiles 0 -FinalSuccess 0 -FinalUnavailable 0 -FinalFailed 1 -UnavailableItems @() -FailedItems @([pscustomobject]@{ Category="fatal"; Id=""; DisplayName="Fatal script error"; OutFile=""; Outcome="Fatal"; Error=$_.Exception.Message }) -Message $msg
     }
     catch {
-        Add-ErrorLog "Unable to write failure run status: $($_.Exception.Message)"
+        $msg = "Fatal error: $($_.Exception.Message)"
+        Add-ErrorLog $msg
+        if ($settings -and $settings.OutputRoot) {
+            try {
+                Write-BackupRunStatus -Root $settings.OutputRoot -RunFolder $outPath -Status "Failure" -ExitCode 1 -Started $runStarted -Completed (Get-Date) -BaseHost $settings.BaseHost -Port $settings.Port -NoDownload ([bool]$NoDownload) -SkippedClusterBackups ([bool]$SkipClusterBackups) -SkippedSwitchBackups ([bool]$SkipSwitchBackups) -SystemConfigFound $configItems.Count -SystemConfigDownloaded 0 -SwitchConfigFound $switchItems.Count -SwitchConfigDownloaded 0 -ClusterFound $clusterItems.Count -ClusterDownloaded 0 -RawAttempts 0 -RawSuccess 0 -RawFailed 0 -RawUnavailable 0 -FinalFiles 0 -FinalSuccess 0 -FinalUnavailable 0 -FinalFailed 1 -UnavailableItems @() -FailedItems @([pscustomobject]@{ Category="fatal"; Id=""; DisplayName="Fatal script error"; OutFile=""; Outcome="Fatal"; Error=$_.Exception.Message }) -Message $msg
+            }
+            catch {
+                Add-ErrorLog "Unable to write failure run status: $($_.Exception.Message)"
+            }
+        }
+        $script:FinalExitCode = 1
     }
-    $script:FinalExitCode = 1
-}
-finally {
-    Remove-RunLock -Lock $runLock
+    finally {
+        Remove-RunLock -Lock $runLock
+    }
+
+    return $script:FinalExitCode
 }
 
-exit $script:FinalExitCode
+if ($MyInvocation.InvocationName -ne '.') {
+    exit (Invoke-RuckusSmartZoneBackup)
+}
